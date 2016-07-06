@@ -34,6 +34,51 @@ object SimRank extends Serializable{
     graphRDD.saveAsTextFile(newPath)
   }
 
+  def localNeighbor(adjListRDD: RDD[(Long, Array[Long])],
+                    inputs: List[Int],
+                    iterations: Int,
+                    threshold: Int
+                   ): Unit = {
+    val reverseGraph = adjListRDD.flatMap(t => {
+      for (v <- t._2)
+        yield (v, t._1)
+    }).combineByKey[Array[Long]](
+      (t: Long) => Array[Long](t),
+      (list :Array[Long], v :Long) => list :+ v,
+      (listA :Array[Long], listB: Array[Long]) => listA ++ listB
+    ).collectAsMap()
+
+    def dfs(graph: scala.collection.Map[Long, Array[Long]],
+            results: mutable.HashSet[Long],
+            length: Int,
+            threshold: Long,
+            vertex: Long,
+            mul: Int,
+            depth: Int): Unit = {
+
+      /** check if we can go deeper */
+      if (depth <= length) {
+        if (graph.contains(vertex)) {
+          val newMul = mul * graph(vertex).length
+          if (newMul >= threshold)
+            return
+          for (w <- graph(vertex)) {
+            results += w
+            dfs(graph, results, length, threshold, w, newMul, depth + 1)
+          }
+        }
+      }
+    }
+
+    var cnt = 0
+    for (u <- inputs) {
+      val results = mutable.HashSet[Long]()
+      dfs(reverseGraph, results, iterations, threshold, u, 1, 0)
+      cnt += results.size
+    }
+    print("average # of neighbors:" + cnt / inputs.length)
+  }
+
   def main (args: Array[String]){
     if (args.length < 4) {
       System.err.println("Usage: ")
@@ -44,7 +89,9 @@ object SimRank extends Serializable{
     val decay = args(3).toDouble
     val threshold = args(4).toInt
 
-    val conf = new SparkConf().setAppName("sSimRank")
+    val file = args(0).split("/").last
+    val conf = new SparkConf().
+      setAppName("sR:" + file + ":" + startVertex + ": " + iterations + ":" + threshold )
 
     conf.set("spark.eventLog.enabled", "true")
     //conf.set("spark.default.parallelism", "144")
@@ -67,22 +114,31 @@ object SimRank extends Serializable{
 
     val sc = new SparkContext(conf)
 
-    val graph = sc.textFile(args(0) + "/*", 120).map(line => {
-      val verteices = line.split("\\s+")
-      (verteices.head.toLong, verteices.tail.map(_.toLong))
-    })
 
-    //val edges = sc.textFile(args(0) + "/*", 120).map(line => {
-    //  val verteices = line.split("\\s+")
-    //  (verteices(0).toLong, verteices(1).toLong)
-    //})//.filter(t => t._1 != t._2).cache()
+    if (!args(0).split("/").last.startsWith("list-")) {
+      val edges = sc.textFile(args(0) + "", 144).map(line => {
+        val verteices = line.split("\\s+")
+        (verteices(0).toLong, verteices(1).toLong)
+      })
+      convert(edges, args(0))
+    }
+    else {
+      val graph = sc.textFile(args(0) + "/*", 144).map(line => {
+        val vertices = line.split("\\s+")
+        (vertices.head.toLong, vertices.tail.map(_.toLong))
+      }).cache()
 
-    //baselineAllPairSimRankLocal(edges, decay, startVertex)
-    //baselineAllPairSimRank(edges, startVertex, iterations, decay, threshold)
-    //baselineSimRank(edges, startVertex, iterations, decay, threshold)
-    //simRankBroadcast(edges, startVertex, iterations, decay, threshold)
-    simRank(graph, startVertex, iterations, decay, threshold)
-    //convert(edges, args(0))
+      //baselineAllPairSimRankLocal(graph, decay, startVertex)
+      //println("seperator! ground vs base")
+      //baselineAllPairSimRank(graph, startVertex, iterations, decay, threshold)
+      //baselineSimRank(graph, startVertex, iterations, decay, threshold)
+      //simRankBroadcast(graph, startVertex, iterations, decay, threshold)
+
+      val startTime = System.currentTimeMillis()
+      simRank(graph, startVertex, iterations, decay, threshold)
+      val endTime = System.currentTimeMillis()
+      println("cnt of time: " + (endTime - startTime) / 1000)
+    }
 
     /**
       * val m = Array.fill(2, 2)(5)
@@ -113,19 +169,15 @@ object SimRank extends Serializable{
       */
   }
 
-  def baselineAllPairSimRankLocal(edgeRDD: RDD[(Long, Long)], c:Double, u: Long): Unit = {
-    val reverse = edgeRDD.map(t => (t._2, t._1)).combineByKey[Array[Long]](
-      (t: Long) => Array[Long](t),
-      (list :Array[Long], v :Long) => list :+ v,
-      (listA :Array[Long], listB: Array[Long]) => listA ++ listB
-    ).collectAsMap()
+  def baselineAllPairSimRankLocal(adjListRDD: RDD[(Long, Array[Long])], c:Double, u: Long): Unit = {
 
-    val graph = mutable.HashMap[Long, ArrayBuffer[Long]]()
-    for ((k, v) <- reverse) {
+    val graph = adjListRDD.collectAsMap()
+    val reverse = mutable.HashMap[Long, ArrayBuffer[Long]]()
+    for ((k, v) <- graph) {
       for (w <- v) {
-        if (!graph.contains(w))
-          graph(w) = ArrayBuffer[Long]()
-        graph(w) += k
+        if (!reverse.contains(w))
+          reverse(w) = ArrayBuffer[Long]()
+        reverse(w) += k
       }
     }
 
@@ -162,29 +214,34 @@ object SimRank extends Serializable{
       cur = next
     }
 
+
+    val resultRDD = adjListRDD.context.parallelize(cur.toSeq, 144)
+      .saveAsTextFile("hdfs://node2:9020/graph/output-allpair-wiki-vote")
+
+
+
     val result = cur.filter(t => t._1._1 == u || t._1._2 == u).map(t =>
       if (t._1._1 == u) (t._1._2, t._2) else (t._1._1, t._2)).toArray.sortBy(_._2)
 
     result.foreach(println)
   }
 
-  def baselineAllPairSimRank(edgeRDD: RDD[(Long, Long)],
+  def baselineAllPairSimRank(adjListRDD: RDD[(Long, Array[Long])],
                              startVertex: Long,
                              iterations: Int,
                              decay: Double,
                              threshold: Long): Unit = {
-    val reverseGraph1 = edgeRDD.map(t => (t._2, t._1)).combineByKey[Array[Long]](
-      (t: Long) => Array[Long](t),
-      (list :Array[Long], v :Long) => list :+ v,
-      (listA :Array[Long], listB: Array[Long]) => listA ++ listB
-    ).cache()
 
-    val reverseGraph = edgeRDD.map(e => (e._2, null))
+    //val reverseGraph = edgeRDD.map(e => (e._2, null))
+    val reverseGraph = adjListRDD.flatMap(t => {
+      for (v <- t._2)
+        yield (v, null)
+    })
 
     /** <vertexID, (inNeighborList, outNeighborList)> */
-    val graph = edgeRDD
+    val graph = adjListRDD
       .cogroup(reverseGraph)
-      .mapValues{case (outNeighbors, inNeighbors) => outNeighbors.toArray}
+      .mapValues{case (outNeighbors, inNeighbors) => outNeighbors.head}
     println("# of vertices is:" + graph.count())
 
     /** <(u, v), (outNeighborsU, outNeighborsV), value */
@@ -288,46 +345,29 @@ object SimRank extends Serializable{
     }
   }
 
-  def simRankBroadcast(edgeRDD: RDD[(Long, Long)],
+  def simRankBroadcast(adjListRDD: RDD[(Long, Array[Long])],
                        startVertex: Long,
                        iterations: Int,
                        decay: Double,
                        threshold: Long): Unit = {
-    /**
-      * case class Walk(//end: Long,
-      * //start: Long,
-      * multiplicity: Int,
-      * vertices: Array[Long]) {
-      * def end = vertices.last
-      * def start = vertices.head
-      * def length = vertices.length
-      * }
-      */
 
     /** calculate local graph */
 
       /**
-    val edges = edgeRDD.collect()
-    val localGraph = mutable.HashMap.empty[Long, mutable.ArrayBuffer[Long]]
-    for (edge <- edges) {
-      if (!localGraph.contains(edge._1))
-        localGraph(edge._1) = mutable.ArrayBuffer.empty[Long]
-      localGraph(edge._1) += edge._2
-    }
-
-    /** calculate local reverse graph */
-    val localReverseGraph = mutable.HashMap.empty[Long, mutable.ArrayBuffer[Long]]
-    for (edge <- edges) {
-      if (!localReverseGraph.contains(edge._2))
-        localReverseGraph(edge._2) = mutable.ArrayBuffer.empty[Long]
-      localReverseGraph(edge._2) += edge._1
-    }
+        * val edges = edgeRDD.collect()
+        * val localGraph = mutable.HashMap.empty[Long, mutable.ArrayBuffer[Long]]
+        * for (edge <- edges) {
+        * if (!localGraph.contains(edge._1))
+        * localGraph(edge._1) = mutable.ArrayBuffer.empty[Long]
+        * localGraph(edge._1) += edge._2
+        * }
+        **
+        *if (!localReverseGraph.contains(edge._2))
+        *localReverseGraph(edge._2) = mutable.ArrayBuffer.empty[Long]
+        *localReverseGraph(edge._2) += edge._1
+        *}
     */
-    val localGraph = edgeRDD.combineByKey[Array[Long]](
-      (t: Long) => Array[Long](t),
-      (list :Array[Long], v :Long) => list :+ v,
-      (listA :Array[Long], listB: Array[Long]) => listA ++ listB
-    ).collectAsMap()
+    val localGraph = adjListRDD.collectAsMap()
 
     val localReverseGraph = mutable.HashMap.empty[Long, mutable.ArrayBuffer[Long]]
     for ((k, v) <- localGraph) {
@@ -409,7 +449,7 @@ object SimRank extends Serializable{
         cnt += v1.size
       }
     }
-    return
+    //return
     println("cnt of walks:" + cnt)
 
     for ((v, map) <- neighborhood) {
@@ -420,9 +460,9 @@ object SimRank extends Serializable{
         }
     }
 
-    val neighborhoodBC = edgeRDD.sparkContext.broadcast(neighborhood)
-    val localIndegreeGraphBC = edgeRDD.sparkContext.broadcast(localIndegreeGraph)
-    val graph = edgeRDD.map(_._1).distinct()
+    val neighborhoodBC = adjListRDD.sparkContext.broadcast(neighborhood)
+    val localIndegreeGraphBC = adjListRDD.sparkContext.broadcast(localIndegreeGraph)
+    val graph = adjListRDD.map(_._1).distinct()
     val walkRDD = graph.filter(v => neighborhoodBC.value.contains(v)).repartition(144).cache()
     val simRankRDD = walkRDD.flatMap(vertex => {
       val queryWalks = neighborhoodBC.value(vertex)
@@ -509,40 +549,39 @@ object SimRank extends Serializable{
     neighborhood
   }
 
-  def simRank(edgeRDD: RDD[(Long, Long)],
+  def simRank(adjListRDD: RDD[(Long, Array[Long])],
               startVertex: Long,
               iterations: Int,
               decay: Double,
               threshold: Long): Unit = {
 
-    /**
-      * case class Walk(end: Long,
-      * start: Long,
-      * lengthLimit: Int,
-      * multiplicity: Long,
-      * vertices: List[Long]) {
-      * def this(end: Long, start: Long, lengthLimit: Int) =
-      * this(end, start, lengthLimit, 1L, List[Long](start))
-      * }
-      */
-
-    val reverseGraph = edgeRDD.map(t => (t._2, t._1)).combineByKey[Array[Long]](
+    val reverseGraph = adjListRDD.flatMap(t => {
+      for (v <- t._2)
+        yield (v, t._1)
+    }).combineByKey[Array[Long]](
       (t: Long) => Array[Long](t),
       (list :Array[Long], v :Long) => list :+ v,
       (listA :Array[Long], listB: Array[Long]) => listA ++ listB
     ).cache()
 
+    if (reverseGraph.filter(t => t._1 == startVertex).count() == 0) {
+      println("cnt of reachable neighbors: " + 0)
+      println("cnt of master walks: " + 0)
+      println("cnt of neighborhood: " + 0)
+      return
+    }
+
     val neighborhood = boundaryDemarcation(reverseGraph, startVertex, threshold, iterations)
     val neighborhoodBC = reverseGraph.sparkContext.broadcast(neighborhood)
 
-    println("cnt of neighbors:" + neighborhood.size)
+    println("cnt of reachable neighbors: " + neighborhood.size)
     var cnt = 0
     for ((k, v) <- neighborhood)  {
       for ((k1, v1) <- v) {
         cnt += v1.size
       }
     }
-    println("cnt of walks:" + cnt)
+    println("cnt of master walks: " + cnt)
    /**
       **
       *for ((v, map) <- neighborhood) {
@@ -562,20 +601,23 @@ object SimRank extends Serializable{
       *)
       */
 
-    /** <vertexID, (indegree, adjacencyList)> */
+    /** < vertexID, (indegree, adjacencyList) > */
     val graph = reverseGraph
       .map(t => (t._1, t._2.size))
-      .cogroup(edgeRDD)
-      .mapValues{case (iterableA, iterableB) => (if(iterableA.isEmpty) 0 else iterableA.head, iterableB.toArray)}
+      .cogroup(adjListRDD)
+      .mapValues{case (iterableA, iterableB) =>
+        (if(iterableA.isEmpty) 0 else iterableA.head,
+          if (iterableB.isEmpty) Array.empty[Long] else iterableB.head)}
       .cache()
     println("# of vertices is:" + graph.count())
 
     //return
 
-    /** <vertexID, (graphlet, outMostNeighbor)> */
+    /** < vertexID, (graphlet, outMostNeighbor)> */
     var propertyGraph = graph
       .filter(v => neighborhoodBC.value.contains(v._1))
-      .map(v => (v._1, (mutable.HashMap[Long, (Int, Array[Long])]((v._1, (v._2._1, v._2._2))), mutable.HashSet[Long]() ++= v._2._2)))
+      .map(v => (v._1, (mutable.HashMap[Long, (Int, Array[Long])]((v._1, (v._2._1, v._2._2))),
+        mutable.HashSet[Long]() ++= v._2._2)))
       .cache()
 
     //for (iter <- 0 until iterations) {
@@ -591,12 +633,18 @@ object SimRank extends Serializable{
       propertyGraph = propertyGraph.leftOuterJoin(outmostRDD).mapValues { case ((graphlet, outmostNeighbor), newOutmostInfoOption) => {
         newOutmostInfoOption match {
           case Some(newOutmostInfo) => {
+            /**
             val newGraphlet = mutable.HashMap[Long, (Int, Array[Long])]()
             newGraphlet ++= newOutmostInfo
             newGraphlet ++= graphlet
+              */
+            //val newGraphlet = (graphlet ++: newOutmostInfo)
+            val newGraphlet = newOutmostInfo ++: graphlet
             val newOutmostNeighbor = mutable.HashSet[Long]()
-            for (neighbors <- newOutmostInfo) {
-              newOutmostNeighbor ++= neighbors._2._2
+            for ((id, (degree, neighbors)) <- newOutmostInfo) {
+              for (neigh <- neighbors if !newGraphlet.contains(neigh)) {
+                newOutmostNeighbor += neigh
+              }
             }
             (newGraphlet, newOutmostNeighbor.filter(!newGraphlet.contains(_)))
           }
@@ -606,8 +654,7 @@ object SimRank extends Serializable{
         .cache()
       propertyGraph.count()
     }
-    println("now # is" + propertyGraph.count())
-    return
+    println("cnt of neighborhood: " + propertyGraph.count())
     /*
    val tu = propertyGraph.collectAsMap()(331L)
     println("for 331, new outmost is:")
@@ -652,28 +699,36 @@ object SimRank extends Serializable{
     }}.cache()
 
     val t = simRankRDD.reduceByKey(_ + _).collect().sortBy(_._2)
+    /**
     println("#pair:" + t.length)
     t.foreach(println)
+      */
   }
 
 
-  def baselineSimRank(edgeRDD: RDD[(Long, Long)],
+  def baselineSimRank(adjListRDD: RDD[(Long, Array[Long])],
               startVertex: Long,
               iterations: Int,
               decay: Double,
               threshold: Long): Unit = {
 
-    val reverseGraph = edgeRDD.map(t => (t._2, t._1)).combineByKey[Array[Long]](
+    val reverseGraph = adjListRDD.flatMap(t => {
+      for (v <- t._2)
+        yield (v, t._1)
+    }).combineByKey[Array[Long]](
       (t: Long) => Array[Long](t),
       (list :Array[Long], v :Long) => list :+ v,
       (listA :Array[Long], listB: Array[Long]) => listA ++ listB
     ).cache()
 
-    /** <vertexID, (indegree, adjacencyList)> */
+
+    /** < vertexID, (indegree, adjacencyList) > */
     val graph = reverseGraph
       .map(t => (t._1, t._2.size))
-      .cogroup(edgeRDD)
-      .mapValues{case (iterableA, iterableB) => (if(iterableA.isEmpty) 0 else iterableA.head, iterableB.toArray)}
+      .cogroup(adjListRDD)
+      .mapValues{case (iterableA, iterableB) =>
+        (if(iterableA.isEmpty) 0 else iterableA.head,
+          if (iterableB.isEmpty) Array.empty[Long] else iterableB.head)}
       .cache()
     println("# of vertices is:" + graph.count())
 
