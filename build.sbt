@@ -8,13 +8,14 @@ libraryDependencies  ++= Seq(
 
   // for hadoop 2.6
   "org.apache.hadoop" % "hadoop-client" % "2.6.0" % "provided",
+
   // for spark 1.3
   "org.apache.spark" %% "spark-core" % "1.6.2" % "provided",
 
-  "org.apache.spark" %% "spark-graphx" % "1.5.2" % "provided",
   // for scala test
-  "org.scalatest" %% "scalatest" % "2.2.1" % "test"
+  "org.scalatest" %% "scalatest" % "3.0.0" % "test"
 
+  //"org.apache.spark" %% "spark-graphx" % "1.5.2" % "provided",
 )
 
 resolvers += "Akka Repository" at "http://repo.akka.io/releases/"

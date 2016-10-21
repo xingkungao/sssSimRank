@@ -35,7 +35,7 @@ object SimRank extends Serializable{
   }
 
   def localNeighbor(adjListRDD: RDD[(Long, Array[Long])],
-                    inputs: List[Int],
+                    inputs: List[Long],
                     iterations: Int,
                     threshold: Int
                    ): Unit = {
@@ -46,7 +46,31 @@ object SimRank extends Serializable{
       (t: Long) => Array[Long](t),
       (list :Array[Long], v :Long) => list :+ v,
       (listA :Array[Long], listB: Array[Long]) => listA ++ listB
-    ).collectAsMap()
+    ).cache()//.collectAsMap()
+
+
+    val reverseGraphBC = adjListRDD.sparkContext.broadcast(reverseGraph)
+
+    def boundaryDemarcation(reverseGraph: RDD[(Long, Array[Long])],
+                          startVertex: Long,
+                          iterations: Int): mutable.HashSet[Long] = {
+      val reachable = mutable.HashSet[Long]()
+      var lastNeighbor = mutable.HashSet[Long](startVertex)
+
+      for (i <- 0 until (iterations + 1)) {
+        val lastNeighborBC = reverseGraph.sparkContext.broadcast(lastNeighbor)
+        val neighborListArray = reverseGraph
+          .filter(e => lastNeighborBC.value.contains(e._1))
+          .map(_._2)
+          .collect()
+        lastNeighbor = mutable.HashSet[Long]()
+        for (tmp <- neighborListArray)
+          lastNeighbor ++= tmp
+
+        reachable ++= lastNeighbor
+      }
+      reachable
+    }
 
     def dfs(graph: scala.collection.Map[Long, Array[Long]],
             results: mutable.HashSet[Long],
@@ -60,8 +84,9 @@ object SimRank extends Serializable{
       if (depth <= length) {
         if (graph.contains(vertex)) {
           val newMul = mul * graph(vertex).length
-          if (newMul >= threshold)
-            return
+
+          //if (newMul >= threshold)
+            //return
           for (w <- graph(vertex)) {
             results += w
             dfs(graph, results, length, threshold, w, newMul, depth + 1)
@@ -71,12 +96,39 @@ object SimRank extends Serializable{
     }
 
     var cnt = 0
+    for (v <- inputs) {
+      val nei = boundaryDemarcation(reverseGraph, v, iterations)
+      println("for: " + v + ", neighbors is:" + nei.size)
+      cnt += nei.size
+    }
+    println("average # of neighbors:" + cnt / inputs.length)
+
+    /**
+    val results = adjListRDD.sparkContext.parallelize(inputs).map(v => {
+      val graph = reverseGraphBC.value
+      val result = mutable.HashSet[Long]()
+      dfs(reverseGraph, result, iterations, threshold, v, 1, 0)
+      (v, result.size)
+    }).collect()
+
+    var cnt = 0
+    for (p <- results) {
+      println("for: " + p._1 + ", neighbors is:" + p._2)
+      cnt += p._2
+    }
+    println("average # of neighbors:" + cnt / results.length)
+      */
+
+    /**
+    var cnt = 0
     for (u <- inputs) {
       val results = mutable.HashSet[Long]()
       dfs(reverseGraph, results, iterations, threshold, u, 1, 0)
+      println("for: " + u + ", neighbors is:" + results.size)
       cnt += results.size
     }
-    print("average # of neighbors:" + cnt / inputs.length)
+    println("average # of neighbors:" + cnt / inputs.length)
+      */
   }
 
   def main (args: Array[String]){
@@ -113,6 +165,19 @@ object SimRank extends Serializable{
       */
 
     val sc = new SparkContext(conf)
+
+    if (false) {
+      val tmp = sc.textFile("hdfs://node2:9020/graph/output-allpair-wiki-vote/*", 144)
+        .map(line => {
+          val pair = line.split(',')
+          ((pair(0).substring(2).toLong, pair(1).substring(0, pair(1).length - 1).toLong),
+            pair(2).substring(0, pair(2).length - 1).toDouble)
+        })
+        .filter(t => t._1._1 == startVertex || t._1._2 == startVertex).map(t =>
+        if (t._1._1 == startVertex) (t._1._2, t._2) else (t._1._1, t._2)).collect().sortBy(_._2)
+      println("#pair:" + tmp.length)
+      tmp.foreach(println)
+    }
 
 
     if (!args(0).split("/").last.startsWith("list-")) {
@@ -196,7 +261,6 @@ object SimRank extends Serializable{
 
     for (k <- 0 until 20) {
       val next = mutable.HashMap[(Long, Long), Double]().withDefaultValue(0.0)
-      println("iteration: " + k)
       for (((a,b), v) <- cur) {
         if (a == b) {
           next((a, b)) = 1.0
@@ -212,6 +276,13 @@ object SimRank extends Serializable{
         }
       }
       cur = next
+      println("iteration: " + k)
+      if (k < 6) {
+        val result = cur.filter(t => t._1._1 == u || t._1._2 == u).map(t =>
+          if (t._1._1 == u) (t._1._2, t._2) else (t._1._1, t._2)).toArray.sortBy(_._2)
+
+        result.foreach(println)
+      }
     }
 
 
@@ -219,11 +290,6 @@ object SimRank extends Serializable{
       .saveAsTextFile("hdfs://node2:9020/graph/output-allpair-wiki-vote")
 
 
-
-    val result = cur.filter(t => t._1._1 == u || t._1._2 == u).map(t =>
-      if (t._1._1 == u) (t._1._2, t._2) else (t._1._1, t._2)).toArray.sortBy(_._2)
-
-    result.foreach(println)
   }
 
   def baselineAllPairSimRank(adjListRDD: RDD[(Long, Array[Long])],
@@ -289,24 +355,24 @@ object SimRank extends Serializable{
                     threshold: Long): Unit = {
     if (lastSimRanks.isEmpty) {
       for (walk <- walks) {
-        val nei = walk.vertices(walk.vertices.length - 2)
-        for (neighbor <- graph(root)._2 if neighbor != nei && !simRanks.contains(neighbor)) {
-          dfs(graph, simRanks, neighbor, neighbor, 1, walk.length - 1, 1, threshold)
+        val branch = walk.vertices(walk.vertices.length - 2)
+        for (neighbor <- graph(root)._2 if neighbor != branch && !simRanks.contains(neighbor)) {
+          dfs(graph, simRanks, neighbor, neighbor, walk.length - 1, 1, 1, threshold)
         }
       }
     }
     else {
       for (walk <- walks) {
-        val nei = walk.vertices(walk.vertices.length - 2)
-        for (neighbor <- graph(root)._2 if neighbor != nei && !simRanks.contains(neighbor)) {
+        val branch = walk.vertices(walk.vertices.length - 2)
+        for (neighbor <- graph(root)._2 if neighbor != branch && !simRanks.contains(neighbor)) {
           if (!lastSimRanks.contains(neighbor)) {
-            dfs(graph, simRanks, neighbor, neighbor, 1, walk.length - 1, 1, threshold)
+            dfs(graph, simRanks, neighbor, neighbor, walk.length - 1, 1, 1, threshold)
           }
           else {
             for ((v, m) <- lastSimRanks(neighbor)) {
               for (neigh <- graph(v)._2) {
                 require(walk.length > lastLevel, s"walklength: ${walk.length}, lastlevel: $lastLevel")
-                dfs(graph, simRanks, neighbor, neigh, 1, walk.length - lastLevel, m, threshold)
+                dfs(graph, simRanks, neighbor, neigh, walk.length - lastLevel, 1, m, threshold)
               }
             }
           }
@@ -316,6 +382,21 @@ object SimRank extends Serializable{
   }
 
 
+  def dfsCheck(graph: mutable.HashMap[Long, (Int, Array[Long])],
+               walks: ArrayBuffer[Walk],
+               threshold: Long): Unit = {
+    for (walk <- walks) {
+      var mul = 1
+      val start = walk.vertices.last
+      require(graph.contains(start))
+      for (v <- walk.vertices.reverse.takeRight(walks.length - 2)) {
+        mul *= graph(v)._1
+      }
+      require(mul < threshold, s"difference ${mul-threshold}")
+    }
+
+  }
+
   def dfs(graph: mutable.HashMap[Long, (Int, Array[Long])],
           simRanks: mutable.HashMap[Long, mutable.ArrayBuffer[(Long, Int)]],
           branch: Long,
@@ -324,23 +405,23 @@ object SimRank extends Serializable{
           depth: Int,
           multiplicity: Int,
           threshold: Long): Unit = {
+
     //require(level <= depth, s"level is $level, depth is $depth")
-    /**
-      * if (!graph.contains(vertex))
-      * return
-      */
+    if (!graph.contains(vertex))
+      return
 
     val newMultiplicity = multiplicity * graph(vertex)._1
     if (newMultiplicity >= threshold)
       return
-    if (level == depth) {
+
+    if (depth == level) {
       if (!simRanks.contains(branch))
         simRanks(branch) = mutable.ArrayBuffer[(Long, Int)]()
       simRanks(branch) += ((vertex, newMultiplicity))
     }
     else {
       for (neighbor <- graph(vertex)._2) {
-        dfs(graph, simRanks, branch, neighbor, level + 1, depth, newMultiplicity, threshold)
+        dfs(graph, simRanks, branch, neighbor, level, depth + 1, newMultiplicity, threshold)
       }
     }
   }
@@ -509,44 +590,48 @@ object SimRank extends Serializable{
     var lastNeighbors = mutable.HashSet[Long]()
     var currentNeighbors = reverseGraph.filter(_._1 == startVertex).collectAsMap()
     require(currentNeighbors.contains(startVertex))
-    for (neighbor <- currentNeighbors(startVertex)) {
-      neighborhood(neighbor) = mutable.HashMap[Int, ArrayBuffer[Walk]](
-        (1, ArrayBuffer[Walk](Walk(currentNeighbors(startVertex).size, Array[Long](startVertex, neighbor)))))
-      lastNeighbors.add(neighbor)
-    }
+    val mul = currentNeighbors(startVertex).length
+    if (mul < threshold) {  //TODO: filter
+      for (neighbor <- currentNeighbors(startVertex)) {
+        neighborhood(neighbor) = mutable.HashMap[Int, ArrayBuffer[Walk]](
+          (1, ArrayBuffer[Walk](Walk(mul, Array[Long](startVertex, neighbor)))))
+        lastNeighbors.add(neighbor)
+      }
 
-    for (i <- 1 until iterations) {
-      val temp = ArrayBuffer[Walk]()
-      val lastNeighborBC = reverseGraph.sparkContext.broadcast(lastNeighbors)
-      currentNeighbors = reverseGraph.filter(e => lastNeighborBC.value.contains(e._1)).collectAsMap()
-      for ((k, v) <- neighborhood) {
-        if (v.contains(i)){ /** have vertices of last level */
-          for (walk <- v(i)) {
-            if (currentNeighbors.contains(walk.end)) {
-              val neighbors = currentNeighbors(walk.end)
-              if (walk.multiplicity * neighbors.length < threshold) {
-                //TODO: filter
-                for (neighbor <- neighbors) {
-                  temp += Walk(walk.multiplicity * neighbors.length, walk.vertices :+ neighbor)
+      for (i <- 1 until iterations) {
+        val temp = ArrayBuffer[Walk]()
+        val lastNeighborBC = reverseGraph.sparkContext.broadcast(lastNeighbors)
+        currentNeighbors = reverseGraph.filter(e => lastNeighborBC.value.contains(e._1)).collectAsMap()
+        for ((k, v) <- neighborhood if v.contains(i)) {
+            /** have vertices of last level */
+            for (walk <- v(i)) {
+              if (currentNeighbors.contains(walk.end)) {
+                val neighbors = currentNeighbors(walk.end)
+                if (walk.multiplicity * neighbors.length < threshold) {
+                  //TODO: filter
+                  for (neighbor <- neighbors) {
+                    temp += Walk(walk.multiplicity * neighbors.length, walk.vertices :+ neighbor)
+                  }
                 }
               }
-            }
           }
         }
-      }
-      lastNeighbors = mutable.HashSet[Long]()
-      for (walk <- temp) {
-        if (!neighborhood.contains(walk.end)) {
-          neighborhood(walk.end) = mutable.HashMap[Int, ArrayBuffer[Walk]]()
+        lastNeighbors = mutable.HashSet[Long]()
+        for (walk <- temp) {
+          if (!neighborhood.contains(walk.end)) {
+            neighborhood(walk.end) = mutable.HashMap[Int, ArrayBuffer[Walk]]()
+          }
+          if (!neighborhood(walk.end).contains(i + 1)) {
+            neighborhood(walk.end)(i + 1) = ArrayBuffer[Walk]()
+          }
+          neighborhood(walk.end)(i + 1) += walk
+          lastNeighbors.add(walk.end)
         }
-        if (!neighborhood(walk.end).contains(i + 1)) {
-          neighborhood(walk.end)(i + 1) = ArrayBuffer[Walk]()
-        }
-        neighborhood(walk.end)(i + 1) += walk
-        lastNeighbors.add(walk.end)
       }
+      neighborhood
     }
-    neighborhood
+    else
+      null
   }
 
   def simRank(adjListRDD: RDD[(Long, Array[Long])],
@@ -555,6 +640,7 @@ object SimRank extends Serializable{
               decay: Double,
               threshold: Long): Unit = {
 
+    /** < vertexID, reverseAdjacencyList > */
     val reverseGraph = adjListRDD.flatMap(t => {
       for (v <- t._2)
         yield (v, t._1)
@@ -564,6 +650,16 @@ object SimRank extends Serializable{
       (listA :Array[Long], listB: Array[Long]) => listA ++ listB
     ).cache()
 
+    /** < vertexID, (indegree, adjacencyList) > */
+    val graph = reverseGraph
+      .map(t => (t._1, t._2.size))
+      .cogroup(adjListRDD)
+      .mapValues{case (iterableA, iterableB) => (
+        if(iterableA.isEmpty) 0 else iterableA.head,
+        if (iterableB.isEmpty) Array.empty[Long] else iterableB.head
+        )}
+      .cache()
+
     if (reverseGraph.filter(t => t._1 == startVertex).count() == 0) {
       println("cnt of reachable neighbors: " + 0)
       println("cnt of master walks: " + 0)
@@ -572,8 +668,18 @@ object SimRank extends Serializable{
     }
 
     val neighborhood = boundaryDemarcation(reverseGraph, startVertex, threshold, iterations)
+
+    if (neighborhood == null) {
+      println("cnt of reachable neighbors: " + 0)
+      println("cnt of master walks: " + 0)
+      println("cnt of neighborhood: " + 0)
+      return
+    }
+
+
     val neighborhoodBC = reverseGraph.sparkContext.broadcast(neighborhood)
 
+    println("# of vertices is:" + graph.count())
     println("cnt of reachable neighbors: " + neighborhood.size)
     var cnt = 0
     for ((k, v) <- neighborhood)  {
@@ -582,6 +688,7 @@ object SimRank extends Serializable{
       }
     }
     println("cnt of master walks: " + cnt)
+
    /**
       **
       *for ((v, map) <- neighborhood) {
@@ -601,56 +708,70 @@ object SimRank extends Serializable{
       *)
       */
 
-    /** < vertexID, (indegree, adjacencyList) > */
-    val graph = reverseGraph
-      .map(t => (t._1, t._2.size))
-      .cogroup(adjListRDD)
-      .mapValues{case (iterableA, iterableB) =>
-        (if(iterableA.isEmpty) 0 else iterableA.head,
-          if (iterableB.isEmpty) Array.empty[Long] else iterableB.head)}
-      .cache()
-    println("# of vertices is:" + graph.count())
 
     //return
 
     /** < vertexID, (graphlet, outMostNeighbor)> */
     var propertyGraph = graph
       .filter(v => neighborhoodBC.value.contains(v._1))
-      .map(v => (v._1, (mutable.HashMap[Long, (Int, Array[Long])]((v._1, (v._2._1, v._2._2))),
-        mutable.HashSet[Long]() ++= v._2._2)))
-      .cache()
+      .map(v => (v._1, (
+        mutable.HashMap[Long, (Int, Array[Long])]((v._1, (v._2._1, v._2._2))),
+        mutable.HashMap[Long, Int]() ++= v._2._2.map(e => (e, 1))
+        //mutable.HashMap[Long, (Int, Array[Long])](),
+        //mutable.HashMap[Long, Int]((v._1, 1))
+        )))
+        .cache()
 
     //for (iter <- 0 until iterations) {
-    for (iter <- 1 until (iterations + 1)) {
+    for (iter <- 0 until (iterations)) {
+
       val outmostRDD = propertyGraph
-        .flatMap { case (root, (graphlet, outmostNeighbor)) => outmostNeighbor.map(v => (v, root))}
+        .flatMap { case (root, (graphlet, outmostNeighbor)) => outmostNeighbor.map(v => (v._1, root))}
         .join(graph)
+        //.filter{ case (outmost, ((root, mul), (indegree, adjacencyList))) => mul * indegree < threshold }
         .map { case (outmost, (root, (indegree, adjacencyList))) =>
           (root, Array[(Long, (Int, Array[Long]))]((outmost, (indegree, adjacencyList))))
         }
         .reduceByKey(_ ++ _)
 
-      propertyGraph = propertyGraph.leftOuterJoin(outmostRDD).mapValues { case ((graphlet, outmostNeighbor), newOutmostInfoOption) => {
-        newOutmostInfoOption match {
-          case Some(newOutmostInfo) => {
-            /**
-            val newGraphlet = mutable.HashMap[Long, (Int, Array[Long])]()
-            newGraphlet ++= newOutmostInfo
-            newGraphlet ++= graphlet
-              */
-            //val newGraphlet = (graphlet ++: newOutmostInfo)
-            val newGraphlet = newOutmostInfo ++: graphlet
-            val newOutmostNeighbor = mutable.HashSet[Long]()
-            for ((id, (degree, neighbors)) <- newOutmostInfo) {
-              for (neigh <- neighbors if !newGraphlet.contains(neigh)) {
-                newOutmostNeighbor += neigh
+      propertyGraph = propertyGraph
+        .leftOuterJoin(outmostRDD)
+        .mapValues { case ((graphlet, outmostNeighbor), newOutmostInfoOption) => {
+          newOutmostInfoOption match {
+            case Some(newOutmostInfo) => {
+              /**
+                * val newGraphlet = mutable.HashMap[Long, (Int, Array[Long])]()
+                * newGraphlet ++= newOutmostInfo
+                * newGraphlet ++= graphlet
+                */
+                /**
+                  * //val newGraphlet = (graphlet ++: newOutmostInfo)
+                  * val newGraphlet = newOutmostInfo ++: graphlet
+                  */
+              val newGraphlet = mutable.HashMap[Long, (Int, Array[Long])]()
+              newGraphlet ++= graphlet
+              val newOutmostNeighbor = mutable.HashMap[Long, Int]()
+              for ((id, (indegree, adj)) <- newOutmostInfo) {
+                val mul = indegree * outmostNeighbor(id)
+                newGraphlet += ((id, (indegree, adj)))
+                if (mul < threshold) {
+                //if (mul < Int.MaxValue) {
+                  for (w <- adj) {
+                    if (!newOutmostNeighbor.contains(w)) {
+                      newOutmostNeighbor(w) = mul
+                    }
+                    else {
+                      val value = newOutmostNeighbor(w)
+                      newOutmostNeighbor(w) = Math.min(mul, value)
+                    }
+                  }
+                }
               }
+              (newGraphlet, newOutmostNeighbor.filter(kv => !newGraphlet.contains(kv._1)))
             }
-            (newGraphlet, newOutmostNeighbor.filter(!newGraphlet.contains(_)))
+            case None => (graphlet, mutable.HashMap[Long, Int]())
           }
-          case None => (graphlet, mutable.HashSet[Long]())
-        }
-      }}
+        }}
         .cache()
       propertyGraph.count()
     }
@@ -677,9 +798,10 @@ object SimRank extends Serializable{
       for (length <- 1 until (iterations + 2)) {
         if (queryWalks.contains(length)) {
           val walks = queryWalks(length)
+          //dfsCheck(graphlet, walks, threshold)
+
           val currentSimRanks = mutable.HashMap[Long, mutable.ArrayBuffer[(Long, Int)]]()
           levelSimRank(graphlet, walks, vertex, lastSimRanks, lastLevel, currentSimRanks, threshold)
-
           for (w <- walks) {
             val secondLast = w.vertices(w.length - 2)
             for (branch <- graphlet(vertex)._2 if branch != secondLast) {
@@ -690,7 +812,6 @@ object SimRank extends Serializable{
               }
             }
           }
-
           lastLevel = length + 1
           lastSimRanks = currentSimRanks
         }
@@ -699,10 +820,9 @@ object SimRank extends Serializable{
     }}.cache()
 
     val t = simRankRDD.reduceByKey(_ + _).collect().sortBy(_._2)
-    /**
+
     println("#pair:" + t.length)
     t.foreach(println)
-      */
   }
 
 
