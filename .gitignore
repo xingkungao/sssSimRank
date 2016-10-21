@@ -21,5 +21,3 @@ project/plugins/project/
 # http://www.scala-sbt.org/release/docs/Getting-Started/Directories.html#configuring-version-control
 .idea/*
 project/*
-
-# Created by .ignore support plugin (hsz.mobi)
